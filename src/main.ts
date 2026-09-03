@@ -49,15 +49,21 @@ export default class WhisperTranscribePlugin extends Plugin {
 		this.statusEl = this.addStatusBarItem();
 		this.statusEl.setText("");
 
-		this.registerEvent(
-			this.app.vault.on("create", (file) => {
-				if (!this.settings.autoTranscribe) return;
-				if (!(file instanceof TFile)) return;
-				if (!this.isInWatchFolder(file)) return;
-				if (!this.isAudioFile(file)) return;
-				this.enqueue(file);
-			})
-		);
+		// Only start listening once the vault has finished its initial load:
+		// "create" also fires for every existing file while Obsidian indexes the
+		// vault (and in bulk when sync pulls a batch), which would otherwise
+		// queue up the entire audio folder at once.
+		this.app.workspace.onLayoutReady(() => {
+			this.registerEvent(
+				this.app.vault.on("create", (file) => {
+					if (!this.settings.autoTranscribe) return;
+					if (!(file instanceof TFile)) return;
+					if (!this.isInWatchFolder(file)) return;
+					if (!this.isAudioFile(file)) return;
+					this.enqueue(file);
+				})
+			);
+		});
 
 		this.addCommand({
 			id: "transcribe-active-file",
@@ -165,40 +171,66 @@ export default class WhisperTranscribePlugin extends Plugin {
 
 	private async getPipeline(): Promise<AsrPipeline> {
 		if (!this.asrPipelinePromise) {
-			this.asrPipelinePromise = this.loadPipeline();
+			this.asrPipelinePromise = this.loadPipeline().catch((err) => {
+				// Never cache a failed load: otherwise one bad attempt (offline,
+				// interrupted download) would poison every later file until restart.
+				this.asrPipelinePromise = null;
+				throw err;
+			});
 		}
 		return this.asrPipelinePromise;
 	}
 
 	private async loadPipeline(): Promise<AsrPipeline> {
-		const { pipeline, env } = await import("@huggingface/transformers");
+		const { pipeline, env } = await importTransformersAsBrowser();
 		env.allowLocalModels = false;
 		env.useBrowserCache = true;
 
-		// Obsidian on desktop is Electron: transformers.js detects the available
-		// Node.js runtime there and switches to the onnxruntime-node backend,
-		// which only knows "cpu"/"dml" — "webgpu" is a browser-only (onnxruntime-web)
-		// execution provider and throws if requested under Node. Mobile Obsidian's
-		// webview has no Node integration, so the browser path (webgpu/wasm) applies.
-		const isNodeRuntime =
-			typeof process !== "undefined" && !!(process.versions && process.versions.node);
+		// Multi-threaded WASM needs SharedArrayBuffer, which requires cross-origin
+		// isolation that Obsidian's app:// context does not provide. Fall back to a
+		// single thread there instead of failing to spin up the worker pool.
+		const wasmBackend = env.backends?.onnx?.wasm;
+		if (
+			wasmBackend &&
+			!(typeof SharedArrayBuffer !== "undefined" && globalThis.crossOriginIsolated)
+		) {
+			wasmBackend.numThreads = 1;
+		}
+
+		const progress_callback = (p: { status: string; progress?: number }) => {
+			if (p.status === "progress" && typeof p.progress === "number") {
+				this.statusEl.setText(
+					`Whisper: загрузка модели ${Math.round(p.progress)}%`
+				);
+			}
+		};
+
 		const hasWebGpu = typeof navigator !== "undefined" && "gpu" in navigator;
-		const device = isNodeRuntime ? "cpu" : hasWebGpu ? "webgpu" : "wasm";
 
 		this.statusEl.setText("Whisper: загружаю модель…");
+		if (hasWebGpu) {
+			try {
+				const gpuAsr = await pipeline(
+					"automatic-speech-recognition",
+					this.settings.modelId,
+					{ device: "webgpu", progress_callback }
+				);
+				return gpuAsr as unknown as AsrPipeline;
+			} catch (err) {
+				// A machine can advertise navigator.gpu and still fail to bring up a
+				// usable adapter (old drivers, blocklisted GPU). WASM always works.
+				console.warn(
+					"whisper-transcribe: WebGPU unavailable, falling back to WASM",
+					err
+				);
+				this.statusEl.setText("Whisper: WebGPU недоступен, перехожу на WASM…");
+			}
+		}
+
 		const asr = await pipeline(
 			"automatic-speech-recognition",
 			this.settings.modelId,
-			{
-				device,
-				progress_callback: (p: { status: string; progress?: number }) => {
-					if (p.status === "progress" && typeof p.progress === "number") {
-						this.statusEl.setText(
-							`Whisper: загрузка модели ${Math.round(p.progress)}%`
-						);
-					}
-				},
-			}
+			{ device: "wasm", progress_callback }
 		);
 		return asr as unknown as AsrPipeline;
 	}
@@ -234,6 +266,55 @@ export default class WhisperTranscribePlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
+	}
+}
+
+/**
+ * Load transformers.js so that it picks its browser backend (onnxruntime-web),
+ * not the Node one.
+ *
+ * The library decides once, at module-evaluation time, with:
+ *     IS_NODE_ENV = typeof process !== 'undefined' && process?.release?.name === 'node'
+ * and on that branch does `ONNX = ONNX_NODE.default ?? ONNX_NODE`.
+ *
+ * Obsidian's desktop app is Electron, so `process.release.name === "node"` is true
+ * in the renderer — but `onnxruntime-node` is a native addon that a distributed
+ * plugin cannot ship (and that does not exist on mobile at all), so that branch
+ * leaves ONNX undefined and every session creation dies on `undefined.create`.
+ *
+ * We therefore mask `process.release.name` for exactly the duration of the import,
+ * which makes desktop follow the same well-tested WASM/WebGPU path as mobile, and
+ * restore the original value immediately afterwards.
+ */
+async function importTransformersAsBrowser() {
+	const canPatch =
+		typeof process !== "undefined" &&
+		!!process &&
+		Object.getOwnPropertyDescriptor(process, "release")?.configurable !== false;
+
+	const original = canPatch
+		? Object.getOwnPropertyDescriptor(process, "release")
+		: undefined;
+
+	if (canPatch) {
+		Object.defineProperty(process, "release", {
+			value: { ...(process.release ?? {}), name: "obsidian-renderer" },
+			configurable: true,
+			writable: true,
+			enumerable: true,
+		});
+	}
+
+	try {
+		return await import("@huggingface/transformers");
+	} finally {
+		if (canPatch) {
+			if (original) {
+				Object.defineProperty(process, "release", original);
+			} else {
+				delete (process as unknown as Record<string, unknown>).release;
+			}
+		}
 	}
 }
 
