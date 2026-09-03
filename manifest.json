@@ -1,0 +1,10 @@
+{
+  "id": "whisper-transcribe",
+  "name": "Whisper Transcribe",
+  "version": "0.1.0",
+  "minAppVersion": "1.4.0",
+  "description": "Auto-transcribes new audio files dropped into a watched folder, in-browser (no server, no Python) via Whisper running through transformers.js. Writes the transcript as a plain note into a configurable output folder.",
+  "author": "ostf14",
+  "authorUrl": "https://github.com/ostf14",
+  "isDesktopOnly": false
+}

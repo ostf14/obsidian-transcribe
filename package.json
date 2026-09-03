@@ -1,0 +1,21 @@
+{
+  "name": "obsidian-whisper-transcribe",
+  "version": "0.1.0",
+  "description": "Auto-transcribe voice memos in Obsidian using an in-browser Whisper model (transformers.js) — no server, no Python.",
+  "main": "main.js",
+  "scripts": {
+    "dev": "node esbuild.config.mjs",
+    "build": "node esbuild.config.mjs production"
+  },
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "builtin-modules": "^3.3.0",
+    "esbuild": "^0.21.0",
+    "obsidian": "^1.5.7",
+    "typescript": "^5.4.0"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.2.0"
+  }
+}
