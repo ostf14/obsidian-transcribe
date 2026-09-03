@@ -175,8 +175,15 @@ export default class WhisperTranscribePlugin extends Plugin {
 		env.allowLocalModels = false;
 		env.useBrowserCache = true;
 
-		const hasWebGpu = "gpu" in navigator;
-		const device = hasWebGpu ? "webgpu" : "wasm";
+		// Obsidian on desktop is Electron: transformers.js detects the available
+		// Node.js runtime there and switches to the onnxruntime-node backend,
+		// which only knows "cpu"/"dml" — "webgpu" is a browser-only (onnxruntime-web)
+		// execution provider and throws if requested under Node. Mobile Obsidian's
+		// webview has no Node integration, so the browser path (webgpu/wasm) applies.
+		const isNodeRuntime =
+			typeof process !== "undefined" && !!(process.versions && process.versions.node);
+		const hasWebGpu = typeof navigator !== "undefined" && "gpu" in navigator;
+		const device = isNodeRuntime ? "cpu" : hasWebGpu ? "webgpu" : "wasm";
 
 		this.statusEl.setText("Whisper: загружаю модель…");
 		const asr = await pipeline(
