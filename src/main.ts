@@ -155,9 +155,12 @@ export default class WhisperTranscribePlugin extends Plugin {
 
 	private buildOutputPath(file: TFile): string {
 		const { date, title } = parseVoiceMemoName(file.basename);
+		// Telegram-style names carry their own timestamp; anything else falls back
+		// to the file's own date rather than a placeholder.
+		const resolvedDate = date ?? formatDate(file.stat?.ctime ?? Date.now());
 		const safeTitle = title.replace(/[\\/:*?"<>|]/g, "_");
 		const outFolder = normalizePath(this.settings.outputFolder);
-		return normalizePath(`${outFolder}/${date} ${safeTitle}.md`);
+		return normalizePath(`${outFolder}/${resolvedDate} ${safeTitle}.md`);
 	}
 
 	private async ensureFolder(path: string) {
@@ -344,14 +347,25 @@ async function withBrowserLikeProcess<T>(fn: () => Promise<T>): Promise<T> {
 	}
 }
 
-/** Mirrors the naming convention used by the one-off Python batch transcription:
- *  "Title DD-MM-YYYY_HH-MM-SS.ext" -> { date: "YYYY-MM-DD", title: "Title" } */
-function parseVoiceMemoName(basename: string): { date: string; title: string } {
+function formatDate(timestamp: number): string {
+	const d = new Date(timestamp);
+	const pad = (n: number) => String(n).padStart(2, "0");
+	return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** Parses the Telegram-export naming convention:
+ *  "Title DD-MM-YYYY_HH-MM-SS.ext" -> { date: "YYYY-MM-DD", title: "Title" }.
+ *  Returns a null date when the name carries no timestamp, so the caller can fall
+ *  back to the file's own date. */
+function parseVoiceMemoName(basename: string): {
+	date: string | null;
+	title: string;
+} {
 	const match = basename.match(
 		/@?(\d{2})-(\d{2})-(\d{4})_(\d{2})-(\d{2})-(\d{2})\s*$/
 	);
 	if (!match) {
-		return { date: "0000-00-00", title: basename.trim() };
+		return { date: null, title: basename.trim() || "Голосовое" };
 	}
 	const [, dd, mm, yyyy] = match;
 	const title = basename.slice(0, match.index).replace(/@\s*$/, "").trim();
