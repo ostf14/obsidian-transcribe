@@ -10,42 +10,72 @@ if you want to view the source, please visit the github repository of this plugi
 
 const prod = process.argv[2] === "production";
 
-const context = await esbuild.context({
-  banner: { js: banner },
-  entryPoints: ["src/main.ts"],
-  bundle: true,
-  external: [
-    "obsidian",
-    "electron",
-    "@codemirror/autocomplete",
-    "@codemirror/collab",
-    "@codemirror/commands",
-    "@codemirror/language",
-    "@codemirror/lint",
-    "@codemirror/search",
-    "@codemirror/state",
-    "@codemirror/view",
-    "@lezer/common",
-    "@lezer/highlight",
-    "@lezer/lr",
-    ...builtins,
-  ],
-  format: "cjs",
-  target: "es2020",
-  logLevel: "info",
-  sourcemap: prod ? false : "inline",
-  treeShaking: true,
-  outfile: "main.js",
-  minify: prod,
-  platform: "browser",
-  define: {
-    "process.env.NODE_ENV": prod ? '"production"' : '"development"',
-  },
-});
+const external = [
+	"obsidian",
+	"electron",
+	"@codemirror/autocomplete",
+	"@codemirror/collab",
+	"@codemirror/commands",
+	"@codemirror/language",
+	"@codemirror/lint",
+	"@codemirror/search",
+	"@codemirror/state",
+	"@codemirror/view",
+	"@lezer/common",
+	"@lezer/highlight",
+	"@lezer/lr",
+	...builtins,
+];
+
+/**
+ * The worker is bundled first and inlined into the plugin bundle as a string, so
+ * the plugin still ships as just main.js + manifest.json while running the model
+ * off the UI thread. It is built as ESM because it is started as a module worker:
+ * onnxruntime-web reaches for its wasm glue with a dynamic import.
+ */
+async function buildWorkerSource() {
+	const result = await esbuild.build({
+		entryPoints: ["src/asr-worker.ts"],
+		bundle: true,
+		external,
+		format: "esm",
+		target: "es2020",
+		platform: "browser",
+		write: false,
+		minify: prod,
+		sourcemap: false,
+		logLevel: "silent",
+		define: { "process.env.NODE_ENV": prod ? '"production"' : '"development"' },
+	});
+	return result.outputFiles[0].text;
+}
+
+async function buildPlugin(workerSource) {
+	return esbuild.context({
+		banner: { js: banner },
+		entryPoints: ["src/main.ts"],
+		bundle: true,
+		external,
+		format: "cjs",
+		target: "es2020",
+		logLevel: "info",
+		sourcemap: prod ? false : "inline",
+		treeShaking: true,
+		outfile: "main.js",
+		minify: prod,
+		platform: "browser",
+		define: {
+			"process.env.NODE_ENV": prod ? '"production"' : '"development"',
+			__ASR_WORKER_SOURCE__: JSON.stringify(workerSource),
+		},
+	});
+}
+
+const context = await buildPlugin(await buildWorkerSource());
 
 if (prod) {
-  await context.rebuild();
-  process.exit(0);
+	await context.rebuild();
+	process.exit(0);
 } else {
-  await context.watch();
+	await context.watch();
 }

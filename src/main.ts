@@ -9,6 +9,7 @@ import {
 	TFolder,
 	normalizePath,
 } from "obsidian";
+import { AsrClient } from "./asr-client";
 import { WHISPER_LANGUAGES } from "./languages";
 
 const AUDIO_EXTENSIONS = ["ogg", "oga", "m4a", "mp3", "wav", "webm", "opus"];
@@ -54,17 +55,10 @@ const DEFAULT_SETTINGS: WhisperTranscribeSettings = {
 	autoTranscribe: true,
 };
 
-// Lazily loaded — transformers.js is a large dependency, only pull it in
-// once transcription is actually needed, not on every Obsidian startup.
-type AsrPipeline = (
-	audio: Float32Array,
-	options?: Record<string, unknown>
-) => Promise<{ text: string }>;
-
 export default class WhisperTranscribePlugin extends Plugin {
 	settings!: WhisperTranscribeSettings;
 
-	private asrPipelinePromise: Promise<AsrPipeline> | null = null;
+	private asr!: AsrClient;
 	private queue: TFile[] = [];
 	private processing = false;
 	private statusEl!: HTMLElement;
@@ -75,6 +69,13 @@ export default class WhisperTranscribePlugin extends Plugin {
 
 		this.statusEl = this.addStatusBarItem();
 		this.statusEl.setText("");
+
+		this.asr = new AsrClient({
+			onProgress: (percent) =>
+				this.statusEl.setText(`Downloading model… ${Math.round(percent)}%`),
+			onWasmFallback: () =>
+				this.statusEl.setText("WebGPU unavailable, using WASM…"),
+		});
 
 		// Only start listening once the vault has finished its initial load:
 		// "create" also fires for every existing file while Obsidian indexes the
@@ -107,10 +108,16 @@ export default class WhisperTranscribePlugin extends Plugin {
 
 	onunload() {
 		this.queue = [];
+		this.asr?.terminate();
+	}
+
+	/** Called when the model setting changes, so the next run loads the new one. */
+	resetModel() {
+		this.asr?.reset();
 	}
 
 	private isInWatchFolder(file: TFile): boolean {
-		const watch = normalizePath(this.settings.watchFolder);
+		const watch = normalizePath(this.settings.watchFolder.trim());
 		if (!watch) return true;
 		return (
 			file.path === watch ||
@@ -157,20 +164,17 @@ export default class WhisperTranscribePlugin extends Plugin {
 
 		try {
 			const audio = await this.decodeToPcm16k(file);
-			const pipeline = await this.getPipeline();
-			const result = await pipeline(audio, {
+			const transcript = await this.asr.transcribe(
+				audio,
+				this.settings.modelId,
 				// Undefined lets Whisper detect the language itself, which is its
 				// native behaviour; a value pins it and skips detection.
-				language:
-					this.settings.language === AUTO_LANGUAGE
-						? undefined
-						: this.settings.language,
-				task: "transcribe",
-				chunk_length_s: 30,
-				stride_length_s: 5,
-			});
+				this.settings.language === AUTO_LANGUAGE
+					? undefined
+					: this.settings.language
+			);
 
-			const text = result.text.trim();
+			const text = transcript.trim();
 			const header = this.settings.noteHeader
 				.replace(/\{\{filename\}\}/g, file.name)
 				.trim();
@@ -219,79 +223,6 @@ export default class WhisperTranscribePlugin extends Plugin {
 		});
 	}
 
-	private async getPipeline(): Promise<AsrPipeline> {
-		if (!this.asrPipelinePromise) {
-			this.asrPipelinePromise = this.loadPipeline().catch((err) => {
-				// Never cache a failed load: otherwise one bad attempt (offline,
-				// interrupted download) would poison every later file until restart.
-				this.asrPipelinePromise = null;
-				throw err;
-			});
-		}
-		return this.asrPipelinePromise;
-	}
-
-	private loadPipeline(): Promise<AsrPipeline> {
-		// The mask has to stay in place for the whole load: the ONNX Runtime wasm
-		// glue only runs its Node check when the backend initialises, which happens
-		// during session creation inside pipeline(), not at import time.
-		return withBrowserLikeProcess(() => this.buildPipeline());
-	}
-
-	private async buildPipeline(): Promise<AsrPipeline> {
-		const { pipeline, env } = await import("@huggingface/transformers");
-		env.allowLocalModels = false;
-		env.useBrowserCache = true;
-
-		// Multi-threaded WASM needs SharedArrayBuffer, which requires cross-origin
-		// isolation that Obsidian's app:// context does not provide. Fall back to a
-		// single thread there instead of failing to spin up the worker pool.
-		const wasmBackend = env.backends?.onnx?.wasm;
-		if (
-			wasmBackend &&
-			!(typeof SharedArrayBuffer !== "undefined" && globalThis.crossOriginIsolated)
-		) {
-			wasmBackend.numThreads = 1;
-		}
-
-		const progress_callback = (p: { status: string; progress?: number }) => {
-			if (p.status === "progress" && typeof p.progress === "number") {
-				this.statusEl.setText(
-					`Downloading model… ${Math.round(p.progress)}%`
-				);
-			}
-		};
-
-		const hasWebGpu = typeof navigator !== "undefined" && "gpu" in navigator;
-
-		this.statusEl.setText("Loading model…");
-		if (hasWebGpu) {
-			try {
-				const gpuAsr = await pipeline(
-					"automatic-speech-recognition",
-					this.settings.modelId,
-					{ device: "webgpu", progress_callback }
-				);
-				return gpuAsr as unknown as AsrPipeline;
-			} catch (err) {
-				// A machine can advertise navigator.gpu and still fail to bring up a
-				// usable adapter (old drivers, blocklisted GPU). WASM always works.
-				console.warn(
-					"whisper-transcribe: WebGPU unavailable, falling back to WASM",
-					err
-				);
-				this.statusEl.setText("WebGPU unavailable, using WASM…");
-			}
-		}
-
-		const asr = await pipeline(
-			"automatic-speech-recognition",
-			this.settings.modelId,
-			{ device: "wasm", progress_callback }
-		);
-		return asr as unknown as AsrPipeline;
-	}
-
 	/** Decode any browser-supported audio file into mono 16kHz PCM, as Whisper expects. */
 	private async decodeToPcm16k(file: TFile): Promise<Float32Array> {
 		const arrayBuffer = await this.app.vault.readBinary(file);
@@ -323,74 +254,6 @@ export default class WhisperTranscribePlugin extends Plugin {
 
 	async saveSettings() {
 		await this.saveData(this.settings);
-	}
-}
-
-/**
- * Run `fn` with `process` looking non-Node, so that transformers.js and the ONNX
- * Runtime it loads both take their browser code paths.
- *
- * Two separate checks force this, and both are hit in Obsidian's desktop app,
- * because an Electron renderer is a browser that also exposes Node:
- *
- * 1. transformers.js, at module-evaluation time:
- *        IS_NODE_ENV = typeof process !== 'undefined' && process?.release?.name === 'node'
- *    On that branch it does `ONNX = ONNX_NODE.default ?? ONNX_NODE` — the native
- *    onnxruntime-node addon, which a distributed plugin cannot ship and which does
- *    not exist on mobile at all. ONNX stays undefined and session creation dies
- *    on `undefined.create`.
- *
- * 2. The ONNX Runtime wasm glue, at the top level of its module:
- *        var isNode = typeof globalThis.process?.versions?.node == 'string';
- *        if (isNode) isPthread = (await import('worker_threads')).workerData === ...
- *    That import cannot resolve in a browser context, so the module throws and
- *    every backend — WebGPU and WASM alike, they share this glue — reports
- *    "no available backend found". (A sibling check in the same file does guard
- *    for Electron via `"renderer" != process.type`; this one does not.)
- *
- * Check 2 fires while the wasm backend initialises, i.e. during session creation,
- * not merely on import — so the mask has to cover the whole model load.
- *
- * Both values are replaced with String *objects* rather than removed: `typeof` no
- * longer reports "string" and `===` against a literal fails, which is exactly what
- * these two checks test, while any other code reading them during the window still
- * sees something that concatenates and compares loosely like the real version.
- */
-async function withBrowserLikeProcess<T>(fn: () => Promise<T>): Promise<T> {
-	const proc =
-		typeof process !== "undefined"
-			? (process as unknown as Record<string, any>)
-			: undefined;
-	if (!proc) return fn();
-
-	const restores: Array<() => void> = [];
-
-	const mask = (owner: Record<string, any>, key: string, realValue: unknown) => {
-		const descriptor = Object.getOwnPropertyDescriptor(owner, key);
-		if (descriptor && !descriptor.configurable) return;
-		Object.defineProperty(owner, key, {
-			value: new String(String(realValue ?? "")),
-			configurable: true,
-			writable: true,
-			enumerable: descriptor?.enumerable ?? true,
-		});
-		restores.push(() => {
-			if (descriptor) Object.defineProperty(owner, key, descriptor);
-			else delete owner[key];
-		});
-	};
-
-	if (typeof proc.release?.name === "string") {
-		mask(proc.release, "name", proc.release.name);
-	}
-	if (typeof proc.versions?.node === "string") {
-		mask(proc.versions, "node", proc.versions.node);
-	}
-
-	try {
-		return await fn();
-	} finally {
-		for (const restore of restores.reverse()) restore();
 	}
 }
 
@@ -518,6 +381,9 @@ class WhisperTranscribeSettingTab extends PluginSettingTab {
 					.onChange(async (value) => {
 						this.plugin.settings.modelId = value;
 						await this.plugin.saveSettings();
+						// Drop the loaded model, otherwise the old one keeps serving
+						// until Obsidian restarts.
+						this.plugin.resetModel();
 						new Notice(
 							"Model changed. It is downloaded on the next transcription."
 						);
