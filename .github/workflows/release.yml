@@ -1,0 +1,44 @@
+name: Release
+
+# Obsidian's convention is a plain version tag with no "v" prefix, matching the
+# version in manifest.json.
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Package
+        run: |
+          PLUGIN_ID=$(node -p "require('./manifest.json').id")
+          mkdir -p "$PLUGIN_ID"
+          cp main.js manifest.json "$PLUGIN_ID/"
+          zip -r "$PLUGIN_ID.zip" "$PLUGIN_ID"
+          echo "PLUGIN_ID=$PLUGIN_ID" >> "$GITHUB_ENV"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            main.js manifest.json "$PLUGIN_ID.zip"

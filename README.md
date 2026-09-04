@@ -37,7 +37,9 @@ Not in the community plugin directory yet. Either:
 
 **With [BRAT](https://github.com/TfTHacker/obsidian42-brat):** BRAT settings → *Add Beta plugin* → `ostf14/obsidian-transcribe`.
 
-**By hand:** download this repository, rename the folder to `whisper-transcribe`, drop it into `<vault>/.obsidian/plugins/`, then enable it under Settings → Community plugins. Only `manifest.json` and `main.js` are needed.
+**By hand:** from the [latest release](https://github.com/ostf14/obsidian-transcribe/releases/latest), download `whisper-transcribe.zip` and unpack it into `<vault>/.obsidian/plugins/` — it already contains a correctly named folder. Then enable the plugin under Settings → Community plugins.
+
+To update afterwards, replacing `main.js` in that folder is enough.
 
 ## Known limitations
 
