@@ -452,7 +452,7 @@ class WhisperTranscribeSettingTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("Model")
 			.setDesc(
-				"Larger models are more accurate but slower, and are downloaded once before first use. On a phone, prefer one of the first two."
+				"Larger models are more accurate but slower. The weights are downloaded once and then kept, so the size matters mostly the first time; the amount of memory they need while running matters every time. Sizes shown are for the GPU path — without a GPU the plugin loads smaller, more compressed weights. On a phone, prefer one of the first two."
 			)
 			.addDropdown((dropdown) => {
 				for (const model of MODELS) {

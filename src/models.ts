@@ -11,14 +11,22 @@ export interface ModelSpec {
 	heavy?: boolean;
 }
 
+// Download sizes are the weights this plugin actually fetches for its own
+// precision choices (see dtypeFor), measured from the model repositories — not
+// the nominal size of the original checkpoint, which is what everyone quotes and
+// which is nowhere near what ends up on disk.
 export const MODELS: ReadonlyArray<ModelSpec> = [
-	{ id: "Xenova/whisper-tiny", label: "Fastest, least accurate — 40 MB" },
-	{ id: "Xenova/whisper-base", label: "Fast — 75 MB" },
-	{ id: "Xenova/whisper-small", label: "Balanced — 250 MB" },
-	{ id: "Xenova/whisper-medium", label: "Accurate, slow — 750 MB", heavy: true },
+	{ id: "Xenova/whisper-tiny", label: "Fastest, least accurate — ~60 MB" },
+	{ id: "Xenova/whisper-base", label: "Fast — ~200 MB" },
+	{ id: "Xenova/whisper-small", label: "Balanced — ~560 MB" },
+	{
+		id: "Xenova/whisper-medium",
+		label: "Accurate, slow — ~1 GB, needs a strong machine",
+		heavy: true,
+	},
 	{
 		id: "onnx-community/whisper-large-v3-turbo",
-		label: "Most accurate, desktop only — 800 MB",
+		label: "Most accurate — ~1.5 GB, GPU with plenty of memory",
 		heavy: true,
 	},
 ];
