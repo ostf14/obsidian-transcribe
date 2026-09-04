@@ -10,7 +10,8 @@ import {
 	normalizePath,
 } from "obsidian";
 import { AsrClient } from "./asr-client";
-import { MODELS } from "./models";
+import { DeviceReport, probeDevice } from "./device-probe";
+import { MODELS, assessModel } from "./models";
 import { WHISPER_LANGUAGES } from "./languages";
 
 const AUDIO_EXTENSIONS = ["ogg", "oga", "m4a", "mp3", "wav", "webm", "opus"];
@@ -393,10 +394,89 @@ class FolderSuggest extends AbstractInputSuggest<TFolder> {
 
 class WhisperTranscribeSettingTab extends PluginSettingTab {
 	plugin: WhisperTranscribePlugin;
+	/** Kept across re-renders so the probe only runs when asked for. */
+	private deviceReport: DeviceReport | null = null;
 
 	constructor(app: App, plugin: WhisperTranscribePlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
+	}
+
+	/**
+	 * Which models this machine can actually carry. Whether a model fits is the
+	 * one thing a user cannot tell from its name or size, and finding out the
+	 * hard way costs a failed run, so it is worth asking the hardware directly.
+	 */
+	private renderCompatibility(containerEl: HTMLElement) {
+		const setting = new Setting(containerEl)
+			.setName("What this device can run")
+			.setDesc(
+				"Checks the GPU and reports which models fit. WebGPU never reveals how much video memory a card has, so this measures what the driver is willing to hand out instead. Treat it as an estimate: on laptops and integrated graphics, where video memory is shared with the system, a driver may promise more than it can comfortably deliver."
+			);
+
+		const results = containerEl.createEl("div", {
+			attr: { style: "margin:-6px 0 18px 0;font-size:var(--font-ui-smaller)" },
+		});
+
+		const render = () => {
+			results.empty();
+			const report = this.deviceReport;
+			if (!report) return;
+
+			const summary = report.hasWebGpu
+				? `GPU: ${report.description ?? "unnamed adapter"}${
+						report.usableGpuBytes
+							? ` — offered ${Math.round(
+									report.usableGpuBytes / (1024 * 1024)
+								)} MB`
+							: ""
+					}`
+				: report.error
+					? `No GPU acceleration (${report.error}) — models run on the CPU`
+					: "No GPU acceleration available — models run on the CPU, slowly";
+
+			results.createEl("div", {
+				text: summary,
+				attr: { style: "opacity:.8;margin-bottom:6px" },
+			});
+
+			for (const model of MODELS) {
+				const { verdict, reason } = assessModel(model, report);
+				const mark = verdict === "ok" ? "✓" : verdict === "tight" ? "!" : "✕";
+				const colour =
+					verdict === "ok"
+						? "var(--text-success)"
+						: verdict === "tight"
+							? "var(--text-warning)"
+							: "var(--text-error)";
+				const row = results.createEl("div", {
+					attr: { style: "display:flex;gap:8px;padding:1px 0" },
+				});
+				row.createEl("span", {
+					text: mark,
+					attr: { style: `color:${colour};width:1em;font-weight:600` },
+				});
+				row.createEl("span", { text: model.label.split(" — ")[0] });
+				row.createEl("span", {
+					text: reason,
+					attr: { style: "opacity:.6" },
+				});
+			}
+		};
+
+		setting.addButton((button) =>
+			button.setButtonText("Check").onClick(async () => {
+				button.setButtonText("Checking…").setDisabled(true);
+				try {
+					this.deviceReport = await probeDevice();
+					render();
+				} finally {
+					button.setButtonText("Check again").setDisabled(false);
+				}
+			})
+		);
+
+		render();
 	}
 
 	display(): void {
@@ -472,6 +552,8 @@ class WhisperTranscribeSettingTab extends PluginSettingTab {
 					});
 			});
 
+		this.renderCompatibility(containerEl);
+
 		new Setting(containerEl)
 			.setName("Language")
 			.setDesc(
@@ -492,6 +574,7 @@ class WhisperTranscribeSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Note header")
+			.setClass("whisper-transcribe-note-header")
 			.setDesc(
 				"First line of each transcript note. {{filename}} is replaced with the audio file's name. Leave empty for no header."
 			)
