@@ -6,22 +6,26 @@
  * The main thread decodes the audio (the Web Audio API is not available here) and
  * hands over plain PCM; everything model-shaped happens in this file.
  */
-import { createAsrPipeline } from "./browser-process";
-
-type AsrPipeline = (
-	audio: Float32Array,
-	options?: Record<string, unknown>
-) => Promise<{ text: string }>;
+import { AsrPipeline, createAsrPipeline } from "./browser-process";
 
 type IncomingMessage =
 	| { type: "init"; modelId: string }
+	| { type: "release" }
 	| {
 			type: "transcribe";
 			id: number;
 			modelId: string;
 			audio: Float32Array;
 			language?: string;
+			forceWasm?: boolean;
 	  };
+
+/** Chunking the pipeline applies to long audio. Each successive window starts
+ *  this many seconds later, which is what lets a timestamp inside a window be
+ *  turned into a position in the whole recording. */
+const CHUNK_LENGTH_S = 30;
+const STRIDE_LENGTH_S = 5;
+const CHUNK_JUMP_S = CHUNK_LENGTH_S - 2 * STRIDE_LENGTH_S;
 
 let pipelinePromise: Promise<AsrPipeline> | null = null;
 let loadedModelId: string | null = null;
@@ -30,10 +34,11 @@ function post(message: Record<string, unknown>, transfer?: Transferable[]) {
 	(self as unknown as Worker).postMessage(message, transfer ?? []);
 }
 
-function getPipeline(modelId: string): Promise<AsrPipeline> {
+function getPipeline(modelId: string, forceWasm = false): Promise<AsrPipeline> {
 	if (!pipelinePromise || loadedModelId !== modelId) {
 		loadedModelId = modelId;
 		pipelinePromise = createAsrPipeline(modelId, {
+			forceWasm,
 			onProgress: (percent) => post({ type: "progress", percent }),
 			onWasmFallback: (err) =>
 				post({ type: "wasm-fallback", error: String(err) }),
@@ -45,7 +50,7 @@ function getPipeline(modelId: string): Promise<AsrPipeline> {
 			throw err;
 		});
 	}
-	return pipelinePromise;
+	return pipelinePromise!;
 }
 
 /** The id currently being worked on, so a failure that escapes the awaited chain
@@ -91,17 +96,26 @@ self.onmessage = async (event: MessageEvent<IncomingMessage>) => {
 		return;
 	}
 
+	if (message.type === "release") {
+		await releasePipeline();
+		return;
+	}
+
 	if (message.type === "transcribe") {
 		activeId = message.id;
 		try {
-			const pipeline = await getPipeline(message.modelId);
-			post({ type: "transcribing" });
+			const pipeline = await getPipeline(message.modelId, message.forceWasm);
+			const duration = message.audio.length / 16000;
+			post({ type: "transcribing", id: message.id, duration });
+
 			const result = await pipeline(message.audio, {
 				language: message.language,
 				task: "transcribe",
-				chunk_length_s: 30,
-				stride_length_s: 5,
+				chunk_length_s: CHUNK_LENGTH_S,
+				stride_length_s: STRIDE_LENGTH_S,
+				streamer: await buildProgressStreamer(pipeline, message.id, duration),
 			});
+
 			if (activeId === message.id) {
 				activeId = null;
 				post({ type: "result", id: message.id, text: result.text });
@@ -114,3 +128,55 @@ self.onmessage = async (event: MessageEvent<IncomingMessage>) => {
 		}
 	}
 };
+
+/**
+ * Reports how far into the recording Whisper has got.
+ *
+ * The pipeline exposes no per-chunk hook, but Whisper's own streamer reports the
+ * timestamps it emits. Those restart at zero in every 30-second window, so a
+ * timestamp going backwards means a new window has begun, and the elapsed audio
+ * is that window's offset plus the position inside it.
+ */
+async function buildProgressStreamer(
+	pipeline: AsrPipeline,
+	id: number,
+	duration: number
+) {
+	const { WhisperTextStreamer } = await import("@huggingface/transformers");
+
+	let windowIndex = 0;
+	let lastTime = 0;
+	let furthest = 0;
+
+	const report = (time: number) => {
+		if (time + 1e-6 < lastTime) windowIndex += 1; // timestamps reset per window
+		lastTime = time;
+		const elapsed = windowIndex * CHUNK_JUMP_S + time;
+		if (elapsed <= furthest) return;
+		furthest = elapsed;
+		post({
+			type: "transcribe-progress",
+			id,
+			seconds: Math.min(elapsed, duration),
+			duration,
+		});
+	};
+
+	return new WhisperTextStreamer(pipeline.tokenizer as any, {
+		on_chunk_start: report,
+		on_chunk_end: report,
+	});
+}
+
+async function releasePipeline() {
+	const pending = pipelinePromise;
+	pipelinePromise = null;
+	loadedModelId = null;
+	if (!pending) return;
+	try {
+		const pipeline = await pending;
+		await pipeline.dispose?.();
+	} catch {
+		/* nothing to release */
+	}
+}

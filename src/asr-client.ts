@@ -7,7 +7,15 @@ declare const __ASR_WORKER_SOURCE__: string;
 export interface AsrHooks {
 	onProgress?: (percent: number) => void;
 	onWasmFallback?: () => void;
-	onTranscribing?: () => void;
+	onTranscribing?: (durationSeconds: number) => void;
+	onTranscribeProgress?: (seconds: number, durationSeconds: number) => void;
+}
+
+/** Allocation failures surface with a few different wordings depending on where
+ *  they happen — the download buffer, the wasm heap, or the GPU. */
+function isOutOfMemory(err: unknown): boolean {
+	const text = String((err as { message?: string })?.message ?? err ?? "");
+	return /allocation failed|out of memory|OOM|RangeError.*buffer/i.test(text);
 }
 
 /** How long the worker may go completely silent — no progress, no result — before
@@ -33,6 +41,8 @@ export class AsrClient {
 	private pending = new Map<number, Pending>();
 	private nextId = 1;
 	private watchdog: number | null = null;
+	private releaseTimer: number | null = null;
+	private forceWasm = false;
 	private inProcess: Promise<
 		(audio: Float32Array, options?: Record<string, unknown>) => Promise<{ text: string }>
 	> | null = null;
@@ -44,16 +54,50 @@ export class AsrClient {
 		modelId: string,
 		language: string | undefined
 	): Promise<string> {
+		this.cancelRelease();
 		const worker = this.ensureWorker();
 		if (worker) {
 			try {
 				return await this.runInWorker(worker, audio, modelId, language);
 			} catch (err) {
-				if (!this.workerUnavailable) throw err;
+				if (isOutOfMemory(err) && !this.forceWasm) {
+					// WebGPU wants the weights resident on the GPU in one piece; WASM is
+					// slower but far less demanding, so it is worth one automatic retry
+					// before bothering the user about model sizes.
+					this.forceWasm = true;
+					this.hooks.onWasmFallback?.();
+					this.terminate();
+					const retryWorker = this.ensureWorker();
+					if (retryWorker) {
+						return this.runInWorker(retryWorker, audio, modelId, language);
+					}
+				} else if (!this.workerUnavailable) {
+					throw err;
+				}
 				// Worker died on startup — retry once in-process rather than failing.
 			}
 		}
 		return this.runInProcess(audio, modelId, language);
+	}
+
+	/** Frees the model after a spell of inactivity: a loaded Whisper holds hundreds
+	 *  of megabytes, and Obsidian stays open for days. Weights are cached on disk,
+	 *  so picking up again costs a reload, not a re-download. */
+	scheduleRelease(delayMs: number) {
+		this.cancelRelease();
+		this.releaseTimer = window.setTimeout(() => {
+			this.releaseTimer = null;
+			if (this.pending.size > 0) return;
+			this.worker?.postMessage({ type: "release" });
+			this.inProcess = null;
+		}, delayMs);
+	}
+
+	private cancelRelease() {
+		if (this.releaseTimer !== null) {
+			window.clearTimeout(this.releaseTimer);
+			this.releaseTimer = null;
+		}
 	}
 
 	/** Drops the loaded model, e.g. after the model setting changed. */
@@ -61,6 +105,7 @@ export class AsrClient {
 		this.terminate();
 		this.inProcess = null;
 		this.workerUnavailable = false;
+		this.forceWasm = false;
 	}
 
 	terminate() {
@@ -115,7 +160,10 @@ export class AsrClient {
 				this.hooks.onWasmFallback?.();
 				return;
 			case "transcribing":
-				this.hooks.onTranscribing?.();
+				this.hooks.onTranscribing?.(message.duration);
+				return;
+			case "transcribe-progress":
+				this.hooks.onTranscribeProgress?.(message.seconds, message.duration);
 				return;
 			case "result": {
 				const pending = this.pending.get(message.id);
@@ -175,7 +223,14 @@ export class AsrClient {
 			// buffer here, so the in-process fallback below would be handed an empty
 			// recording if the worker turned out to be unusable. A few megabytes of
 			// PCM is a cheap price for that not to happen.
-			worker.postMessage({ type: "transcribe", id, modelId, audio, language });
+			worker.postMessage({
+				type: "transcribe",
+				id,
+				modelId,
+				audio,
+				language,
+				forceWasm: this.forceWasm,
+			});
 			this.noteActivity();
 		});
 	}
@@ -187,6 +242,7 @@ export class AsrClient {
 	): Promise<string> {
 		if (!this.inProcess) {
 			this.inProcess = createAsrPipeline(modelId, {
+				forceWasm: this.forceWasm,
 				onProgress: this.hooks.onProgress,
 				onWasmFallback: () => this.hooks.onWasmFallback?.(),
 			}).catch((err) => {

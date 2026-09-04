@@ -17,6 +17,9 @@ const AUDIO_EXTENSIONS = ["ogg", "oga", "m4a", "mp3", "wav", "webm", "opus"];
 
 const AUTO_LANGUAGE = "auto";
 
+/** How long a loaded model may sit unused before it is released. */
+const IDLE_RELEASE_MS = 5 * 60 * 1000;
+
 interface WhisperTranscribeSettings {
 	watchFolder: string;
 	outputFolder: string;
@@ -43,6 +46,7 @@ export default class WhisperTranscribePlugin extends Plugin {
 	private queue: TFile[] = [];
 	private processing = false;
 	private statusEl!: HTMLElement;
+	private activeProgress: NoticeProgress | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -52,14 +56,26 @@ export default class WhisperTranscribePlugin extends Plugin {
 		this.statusEl.setText("");
 
 		this.asr = new AsrClient({
-			onProgress: (percent) =>
-				this.statusEl.setText(`Downloading model… ${Math.round(percent)}%`),
-			onWasmFallback: () =>
-				this.statusEl.setText("WebGPU unavailable, using WASM…"),
+			onProgress: (percent) => {
+				this.statusEl.setText(`Downloading model… ${Math.round(percent)}%`);
+				this.activeProgress?.setStage("Downloading model", percent / 100);
+			},
+			onWasmFallback: () => {
+				this.statusEl.setText("Using WASM (slower)…");
+				this.activeProgress?.setStage("Switching to WASM (slower)", null);
+			},
 			// The model is only loaded once, so telling the two stages apart matters:
 			// a long wait during the download means something different to the user
 			// than a long wait during inference.
-			onTranscribing: () => this.statusEl.setText("Transcribing…"),
+			onTranscribing: (duration) => {
+				this.statusEl.setText("Transcribing…");
+				this.activeProgress?.startTranscribing(duration);
+			},
+			onTranscribeProgress: (seconds, duration) => {
+				const share = duration > 0 ? seconds / duration : 0;
+				this.statusEl.setText(`Transcribing… ${Math.round(share * 100)}%`);
+				this.activeProgress?.setStage("Transcribing", share, seconds, duration);
+			},
 		});
 
 		// Only start listening once the vault has finished its initial load:
@@ -145,7 +161,9 @@ export default class WhisperTranscribePlugin extends Plugin {
 		this.statusEl.setText(
 			`Transcribing ${file.name}${queued > 0 ? ` (+${queued} queued)` : ""}…`
 		);
-		const notice = new Notice(`Transcribing "${file.name}"…`, 0);
+		const notice = new Notice("", 0);
+		const progress = new NoticeProgress(notice, file.name, queued);
+		this.activeProgress = progress;
 
 		try {
 			const audio = await this.decodeToPcm16k(file);
@@ -168,14 +186,20 @@ export default class WhisperTranscribePlugin extends Plugin {
 			await this.ensureFolder(this.outputFolderFor(file));
 			await this.app.vault.create(outPath, content);
 
-			notice.setMessage(`Transcribed "${file.name}"`);
+			progress.finish(`Transcribed "${file.name}"`);
 		} catch (err) {
 			console.error("whisper-transcribe: failed on", file.path, err);
-			notice.setMessage(
-				`Could not transcribe "${file.name}" — see the developer console`
+			progress.finish(
+				`Could not transcribe "${file.name}": ${
+					(err as Error)?.message ?? "see the developer console"
+				}`
 			);
 		} finally {
-			window.setTimeout(() => notice.hide(), 4000);
+			this.activeProgress = null;
+			window.setTimeout(() => notice.hide(), 6000);
+			// Nothing left to do soon? Let the model go rather than pinning hundreds
+			// of megabytes for the rest of the Obsidian session.
+			if (this.queue.length === 0) this.asr.scheduleRelease(IDLE_RELEASE_MS);
 		}
 	}
 
@@ -240,6 +264,79 @@ export default class WhisperTranscribePlugin extends Plugin {
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
+}
+
+/**
+ * A progress bar drawn inside the notice.
+ *
+ * Both stages report real numbers — bytes for the download, position in the
+ * recording for the transcription — so the bar never invents motion it does not
+ * know about. The one genuinely unknown stretch, loading the weights into the
+ * runtime, is shown as a stripeless bar rather than a fake percentage.
+ */
+class NoticeProgress {
+	private labelEl: HTMLElement;
+	private barEl: HTMLElement;
+	private fillEl: HTMLElement;
+
+	constructor(notice: Notice, private fileName: string, queued: number) {
+		const root = notice.noticeEl;
+		root.empty();
+		root.createEl("div", {
+			text: `${fileName}${queued > 0 ? ` (+${queued} queued)` : ""}`,
+			attr: { style: "font-weight:600;margin-bottom:4px" },
+		});
+		this.labelEl = root.createEl("div", {
+			text: "Preparing…",
+			attr: { style: "font-size:var(--font-ui-smaller);opacity:.8" },
+		});
+		this.barEl = root.createEl("div", {
+			attr: {
+				style:
+					"margin-top:6px;height:4px;border-radius:2px;overflow:hidden;background:var(--background-modifier-border)",
+			},
+		});
+		this.fillEl = this.barEl.createEl("div", {
+			attr: {
+				style:
+					"height:100%;width:0%;border-radius:2px;background:var(--interactive-accent);transition:width .2s linear",
+			},
+		});
+	}
+
+	setStage(
+		label: string,
+		share: number | null,
+		seconds?: number,
+		duration?: number
+	) {
+		const suffix =
+			seconds !== undefined && duration !== undefined
+				? ` — ${formatClock(seconds)} of ${formatClock(duration)}`
+				: share !== null
+					? ` — ${Math.round(share * 100)}%`
+					: "";
+		this.labelEl.setText(`${label}${suffix}`);
+		this.fillEl.style.width = share === null ? "100%" : `${Math.round(share * 100)}%`;
+		this.fillEl.style.opacity = share === null ? "0.35" : "1";
+	}
+
+	startTranscribing(duration: number) {
+		this.setStage("Transcribing", 0, 0, duration);
+	}
+
+	finish(message: string) {
+		this.labelEl.setText(message);
+		this.fillEl.style.width = "100%";
+		this.fillEl.style.opacity = "1";
+	}
+}
+
+function formatClock(seconds: number): string {
+	const total = Math.max(0, Math.round(seconds));
+	const m = Math.floor(total / 60);
+	const s = total % 60;
+	return `${m}:${String(s).padStart(2, "0")}`;
 }
 
 function formatDate(timestamp: number): string {

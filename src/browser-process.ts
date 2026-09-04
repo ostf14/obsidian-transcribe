@@ -1,3 +1,5 @@
+import { dtypeFor, findModel } from "./models";
+
 /**
  * Run `fn` with `process` looking non-Node, so that transformers.js and the ONNX
  * Runtime it loads both take their browser code paths.
@@ -69,17 +71,26 @@ export async function withBrowserLikeProcess<T>(fn: () => Promise<T>): Promise<T
 	}
 }
 
-import { dtypeFor, findModel } from "./models";
+export interface AsrPipeline {
+	(audio: Float32Array, options?: Record<string, unknown>): Promise<{
+		text: string;
+	}>;
+	/** Needed to build a Whisper streamer for progress reporting. */
+	tokenizer: unknown;
+	dispose?: () => Promise<void>;
+}
 
 /** Builds the ASR pipeline, preferring WebGPU and falling back to WASM. Shared by
  *  the worker and by the in-process path used when a worker cannot be created. */
 export async function createAsrPipeline(
 	modelId: string,
 	hooks: {
+		/** Skip WebGPU entirely — used after it ran the machine out of memory. */
+		forceWasm?: boolean;
 		onProgress?: (percent: number) => void;
 		onWasmFallback?: (err: unknown) => void;
 	} = {}
-): Promise<(audio: Float32Array, options?: Record<string, unknown>) => Promise<{ text: string }>> {
+): Promise<AsrPipeline> {
 	return withBrowserLikeProcess(async () => {
 		const { pipeline, env } = await import("@huggingface/transformers");
 		env.allowLocalModels = false;
@@ -103,7 +114,7 @@ export async function createAsrPipeline(
 
 		const model = findModel(modelId);
 
-		if (typeof navigator !== "undefined" && "gpu" in navigator) {
+		if (!hooks.forceWasm && typeof navigator !== "undefined" && "gpu" in navigator) {
 			try {
 				const gpu = await pipeline("automatic-speech-recognition", modelId, {
 					device: "webgpu",
