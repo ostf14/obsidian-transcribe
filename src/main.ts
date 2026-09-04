@@ -181,8 +181,15 @@ export default class WhisperTranscribePlugin extends Plugin {
 		return this.asrPipelinePromise;
 	}
 
-	private async loadPipeline(): Promise<AsrPipeline> {
-		const { pipeline, env } = await importTransformersAsBrowser();
+	private loadPipeline(): Promise<AsrPipeline> {
+		// The mask has to stay in place for the whole load: the ONNX Runtime wasm
+		// glue only runs its Node check when the backend initialises, which happens
+		// during session creation inside pipeline(), not at import time.
+		return withBrowserLikeProcess(() => this.buildPipeline());
+	}
+
+	private async buildPipeline(): Promise<AsrPipeline> {
+		const { pipeline, env } = await import("@huggingface/transformers");
 		env.allowLocalModels = false;
 		env.useBrowserCache = true;
 
@@ -270,51 +277,70 @@ export default class WhisperTranscribePlugin extends Plugin {
 }
 
 /**
- * Load transformers.js so that it picks its browser backend (onnxruntime-web),
- * not the Node one.
+ * Run `fn` with `process` looking non-Node, so that transformers.js and the ONNX
+ * Runtime it loads both take their browser code paths.
  *
- * The library decides once, at module-evaluation time, with:
- *     IS_NODE_ENV = typeof process !== 'undefined' && process?.release?.name === 'node'
- * and on that branch does `ONNX = ONNX_NODE.default ?? ONNX_NODE`.
+ * Two separate checks force this, and both are hit in Obsidian's desktop app,
+ * because an Electron renderer is a browser that also exposes Node:
  *
- * Obsidian's desktop app is Electron, so `process.release.name === "node"` is true
- * in the renderer — but `onnxruntime-node` is a native addon that a distributed
- * plugin cannot ship (and that does not exist on mobile at all), so that branch
- * leaves ONNX undefined and every session creation dies on `undefined.create`.
+ * 1. transformers.js, at module-evaluation time:
+ *        IS_NODE_ENV = typeof process !== 'undefined' && process?.release?.name === 'node'
+ *    On that branch it does `ONNX = ONNX_NODE.default ?? ONNX_NODE` — the native
+ *    onnxruntime-node addon, which a distributed plugin cannot ship and which does
+ *    not exist on mobile at all. ONNX stays undefined and session creation dies
+ *    on `undefined.create`.
  *
- * We therefore mask `process.release.name` for exactly the duration of the import,
- * which makes desktop follow the same well-tested WASM/WebGPU path as mobile, and
- * restore the original value immediately afterwards.
+ * 2. The ONNX Runtime wasm glue, at the top level of its module:
+ *        var isNode = typeof globalThis.process?.versions?.node == 'string';
+ *        if (isNode) isPthread = (await import('worker_threads')).workerData === ...
+ *    That import cannot resolve in a browser context, so the module throws and
+ *    every backend — WebGPU and WASM alike, they share this glue — reports
+ *    "no available backend found". (A sibling check in the same file does guard
+ *    for Electron via `"renderer" != process.type`; this one does not.)
+ *
+ * Check 2 fires while the wasm backend initialises, i.e. during session creation,
+ * not merely on import — so the mask has to cover the whole model load.
+ *
+ * Both values are replaced with String *objects* rather than removed: `typeof` no
+ * longer reports "string" and `===` against a literal fails, which is exactly what
+ * these two checks test, while any other code reading them during the window still
+ * sees something that concatenates and compares loosely like the real version.
  */
-async function importTransformersAsBrowser() {
-	const canPatch =
-		typeof process !== "undefined" &&
-		!!process &&
-		Object.getOwnPropertyDescriptor(process, "release")?.configurable !== false;
+async function withBrowserLikeProcess<T>(fn: () => Promise<T>): Promise<T> {
+	const proc =
+		typeof process !== "undefined"
+			? (process as unknown as Record<string, any>)
+			: undefined;
+	if (!proc) return fn();
 
-	const original = canPatch
-		? Object.getOwnPropertyDescriptor(process, "release")
-		: undefined;
+	const restores: Array<() => void> = [];
 
-	if (canPatch) {
-		Object.defineProperty(process, "release", {
-			value: { ...(process.release ?? {}), name: "obsidian-renderer" },
+	const mask = (owner: Record<string, any>, key: string, realValue: unknown) => {
+		const descriptor = Object.getOwnPropertyDescriptor(owner, key);
+		if (descriptor && !descriptor.configurable) return;
+		Object.defineProperty(owner, key, {
+			value: new String(String(realValue ?? "")),
 			configurable: true,
 			writable: true,
-			enumerable: true,
+			enumerable: descriptor?.enumerable ?? true,
 		});
+		restores.push(() => {
+			if (descriptor) Object.defineProperty(owner, key, descriptor);
+			else delete owner[key];
+		});
+	};
+
+	if (typeof proc.release?.name === "string") {
+		mask(proc.release, "name", proc.release.name);
+	}
+	if (typeof proc.versions?.node === "string") {
+		mask(proc.versions, "node", proc.versions.node);
 	}
 
 	try {
-		return await import("@huggingface/transformers");
+		return await fn();
 	} finally {
-		if (canPatch) {
-			if (original) {
-				Object.defineProperty(process, "release", original);
-			} else {
-				delete (process as unknown as Record<string, unknown>).release;
-			}
-		}
+		for (const restore of restores.reverse()) restore();
 	}
 }
 
