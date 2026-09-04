@@ -1,45 +1,58 @@
 # Whisper Transcribe
 
-Автоматически расшифровывает голосовые заметки в Obsidian — прямо в браузере/приложении, без сервера и без Python. Работает через [transformers.js](https://github.com/huggingface/transformers.js) (модель Whisper, ONNX + WebGPU/WASM).
+Transcribes voice memos and other audio into notes, entirely on your device — no server, no API key, no Python. Runs a Whisper model inside Obsidian itself via [transformers.js](https://github.com/huggingface/transformers.js) (ONNX, WebGPU with a WASM fallback).
 
-## Что делает
+## What it does
 
-1. Следит за указанной папкой в vault'е (по умолчанию `Телеграм аудио`).
-2. Как только там появляется новый аудиофайл (`.ogg`, `.oga`, `.m4a`, `.mp3`, `.wav`, `.webm`, `.opus`) — запускает расшифровку.
-3. Кладёт результат отдельной заметкой в папку для результата (по умолчанию `inbox`), с именем `YYYY-MM-DD Тема.md`, где дата/тема вытаскиваются из имени аудиофайла (формат `Тема DD-MM-YYYY_HH-MM-SS.ext`), либо просто из исходного имени, если такого паттерна нет.
-4. Исходный аудиофайл не трогает и не удаляет.
+1. Watches a folder in your vault (or the whole vault, if you leave the setting empty).
+2. When a new audio file appears — `.ogg`, `.oga`, `.m4a`, `.mp3`, `.wav`, `.webm`, `.opus` — it transcribes it.
+3. Writes the transcript as a note named `YYYY-MM-DD Title.md`. The date and title come from the audio file's name when it carries a timestamp (`Title DD-MM-YYYY_HH-MM-SS.ogg`, the Telegram export format), otherwise from the file's own name and date.
+4. Leaves the audio file untouched, and never overwrites an existing transcript.
 
-Можно и вручную: команда **Transcribe current audio file** для выбранного/открытого аудио.
+There is also a command, **Transcribe current audio file**, for doing one on demand.
 
-## Модель и производительность
+## Models
 
-Модель качается один раз при первом запуске (кэшируется браузером/Obsidian) и дальше работает офлайн. Есть выбор размера в настройках:
+The model is downloaded once on first use and cached, so afterwards it works offline. Pick the trade-off in settings:
 
-- **tiny** (~40 МБ) — быстрее всего, ниже точность
-- **base** (~74 МБ) — баланс, по умолчанию
-- **small** (~250 МБ) — точнее, тяжелее для телефона
+| Setting | Whisper model | Size |
+| --- | --- | --- |
+| Fastest, least accurate | tiny | 40 MB |
+| Fast | base | 75 MB |
+| Balanced | small | 250 MB |
+| Accurate, slow | medium | 750 MB |
+| Most accurate, desktop only | large-v3-turbo | 800 MB |
 
-На устройстве с WebGPU используется он, иначе — WASM (медленнее, но работает везде, включая старые телефоны).
+Accuracy differences are large on names, jargon and unclear speech. On a phone, stay with one of the first two.
 
-## Установка
+Where WebGPU is available it is used; otherwise the plugin falls back to WASM, which works everywhere but is considerably slower.
 
-Плагин пока не в официальном каталоге Obsidian. Ставится через [BRAT](https://github.com/TfTHacker/obsidian42-brat):
+## Language
 
-1. Установи плагин **BRAT** через Community plugins
-2. В настройках BRAT → **Add Beta plugin** → вставь `ostf14/obsidian-transcribe`
-3. Включи **Whisper Transcribe** в Community plugins
-4. Настрой папки в настройках плагина под свой vault
+Whisper detects the language by itself, so leave **Language** on *Detect automatically*. Pin a language only when detection guesses wrong, which mostly happens on very short or noisy recordings.
 
-## Разработка
+## Installation
+
+Not in the community plugin directory yet. Either:
+
+**With [BRAT](https://github.com/TfTHacker/obsidian42-brat):** BRAT settings → *Add Beta plugin* → `ostf14/obsidian-transcribe`.
+
+**By hand:** download this repository, rename the folder to `whisper-transcribe`, drop it into `<vault>/.obsidian/plugins/`, then enable it under Settings → Community plugins. Only `manifest.json` and `main.js` are needed.
+
+## Known limitations
+
+- Transcription currently runs on the main thread, so Obsidian's interface can stutter or freeze while a long recording is being processed.
+- The first run needs an internet connection to fetch the model.
+- Requires Obsidian 1.4.0 or newer.
+
+## Development
 
 ```bash
 npm install
-npm run dev    # watch-сборка
-npm run build  # production-сборка (main.js)
+npm run dev    # watch build
+npm run build  # production build (main.js)
 ```
 
-## Известные ограничения
+## License
 
-- Требует Obsidian ≥ 1.4.0
-- На мобильных устройствах без WebGPU расшифровка идёт через WASM — медленнее, длинные файлы могут заметно грузить телефон
-- Первый запуск требует интернет (скачать модель), дальше работает офлайн
+MIT

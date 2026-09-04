@@ -1,4 +1,5 @@
 import {
+	AbstractInputSuggest,
 	App,
 	Notice,
 	Plugin,
@@ -8,22 +9,48 @@ import {
 	TFolder,
 	normalizePath,
 } from "obsidian";
+import { WHISPER_LANGUAGES } from "./languages";
 
 const AUDIO_EXTENSIONS = ["ogg", "oga", "m4a", "mp3", "wav", "webm", "opus"];
+
+/**
+ * Whisper's own checkpoint names (tiny/base/small/medium/large) say nothing about
+ * what a user actually chooses between, so the dropdown is labelled by the
+ * trade-off — speed against accuracy — with the download size, which is the other
+ * thing that matters, especially on a phone.
+ */
+const MODELS: ReadonlyArray<{
+	id: string;
+	label: string;
+}> = [
+	{ id: "Xenova/whisper-tiny", label: "Fastest, least accurate — 40 MB" },
+	{ id: "Xenova/whisper-base", label: "Fast — 75 MB" },
+	{ id: "Xenova/whisper-small", label: "Balanced — 250 MB" },
+	{ id: "Xenova/whisper-medium", label: "Accurate, slow — 750 MB" },
+	{
+		id: "onnx-community/whisper-large-v3-turbo",
+		label: "Most accurate, desktop only — 800 MB",
+	},
+];
+
+const AUTO_LANGUAGE = "auto";
 
 interface WhisperTranscribeSettings {
 	watchFolder: string;
 	outputFolder: string;
 	modelId: string;
+	/** Whisper language name, or AUTO_LANGUAGE to let the model detect it. */
 	language: string;
+	noteHeader: string;
 	autoTranscribe: boolean;
 }
 
 const DEFAULT_SETTINGS: WhisperTranscribeSettings = {
-	watchFolder: "Телеграм аудио",
-	outputFolder: "inbox",
+	watchFolder: "",
+	outputFolder: "",
 	modelId: "Xenova/whisper-base",
-	language: "russian",
+	language: AUTO_LANGUAGE,
+	noteHeader: "[Source: voice memo «{{filename}}»]",
 	autoTranscribe: true,
 };
 
@@ -122,35 +149,53 @@ export default class WhisperTranscribePlugin extends Plugin {
 			return; // already transcribed, never overwrite
 		}
 
-		this.statusEl.setText(`Whisper: расшифровываю ${file.name}…`);
-		const notice = new Notice(
-			`Расшифровываю «${file.name}»…`,
-			0
+		const queued = this.queue.length;
+		this.statusEl.setText(
+			`Transcribing ${file.name}${queued > 0 ? ` (+${queued} queued)` : ""}…`
 		);
+		const notice = new Notice(`Transcribing "${file.name}"…`, 0);
 
 		try {
 			const audio = await this.decodeToPcm16k(file);
 			const pipeline = await this.getPipeline();
 			const result = await pipeline(audio, {
-				language: this.settings.language,
+				// Undefined lets Whisper detect the language itself, which is its
+				// native behaviour; a value pins it and skips detection.
+				language:
+					this.settings.language === AUTO_LANGUAGE
+						? undefined
+						: this.settings.language,
 				task: "transcribe",
 				chunk_length_s: 30,
 				stride_length_s: 5,
 			});
 
 			const text = result.text.trim();
-			const content = `[Источник: голосовое «${file.name}»]\n\n${text}\n`;
+			const header = this.settings.noteHeader
+				.replace(/\{\{filename\}\}/g, file.name)
+				.trim();
+			const content = header ? `${header}\n\n${text}\n` : `${text}\n`;
 
-			await this.ensureFolder(this.settings.outputFolder);
+			await this.ensureFolder(this.outputFolderFor(file));
 			await this.app.vault.create(outPath, content);
 
-			notice.setMessage(`Готово: ${file.name}`);
+			notice.setMessage(`Transcribed "${file.name}"`);
 		} catch (err) {
 			console.error("whisper-transcribe: failed on", file.path, err);
-			notice.setMessage(`Ошибка расшифровки «${file.name}» — см. консоль`);
+			notice.setMessage(
+				`Could not transcribe "${file.name}" — see the developer console`
+			);
 		} finally {
 			window.setTimeout(() => notice.hide(), 4000);
 		}
+	}
+
+	/** Empty setting means "next to the audio file", which needs no configuration
+	 *  to make sense in a vault this plugin knows nothing about. */
+	private outputFolderFor(file: TFile): string {
+		const configured = this.settings.outputFolder.trim();
+		if (configured) return normalizePath(configured);
+		return file.parent?.path ?? "";
 	}
 
 	private buildOutputPath(file: TFile): string {
@@ -159,11 +204,13 @@ export default class WhisperTranscribePlugin extends Plugin {
 		// to the file's own date rather than a placeholder.
 		const resolvedDate = date ?? formatDate(file.stat?.ctime ?? Date.now());
 		const safeTitle = title.replace(/[\\/:*?"<>|]/g, "_");
-		const outFolder = normalizePath(this.settings.outputFolder);
-		return normalizePath(`${outFolder}/${resolvedDate} ${safeTitle}.md`);
+		const outFolder = this.outputFolderFor(file);
+		const name = `${resolvedDate} ${safeTitle}.md`;
+		return normalizePath(outFolder ? `${outFolder}/${name}` : name);
 	}
 
 	private async ensureFolder(path: string) {
+		if (!path) return; // vault root
 		const normalized = normalizePath(path);
 		const existing = this.app.vault.getAbstractFileByPath(normalized);
 		if (existing instanceof TFolder) return;
@@ -210,14 +257,14 @@ export default class WhisperTranscribePlugin extends Plugin {
 		const progress_callback = (p: { status: string; progress?: number }) => {
 			if (p.status === "progress" && typeof p.progress === "number") {
 				this.statusEl.setText(
-					`Whisper: загрузка модели ${Math.round(p.progress)}%`
+					`Downloading model… ${Math.round(p.progress)}%`
 				);
 			}
 		};
 
 		const hasWebGpu = typeof navigator !== "undefined" && "gpu" in navigator;
 
-		this.statusEl.setText("Whisper: загружаю модель…");
+		this.statusEl.setText("Loading model…");
 		if (hasWebGpu) {
 			try {
 				const gpuAsr = await pipeline(
@@ -233,7 +280,7 @@ export default class WhisperTranscribePlugin extends Plugin {
 					"whisper-transcribe: WebGPU unavailable, falling back to WASM",
 					err
 				);
-				this.statusEl.setText("Whisper: WebGPU недоступен, перехожу на WASM…");
+				this.statusEl.setText("WebGPU unavailable, using WASM…");
 			}
 		}
 
@@ -365,11 +412,38 @@ function parseVoiceMemoName(basename: string): {
 		/@?(\d{2})-(\d{2})-(\d{4})_(\d{2})-(\d{2})-(\d{2})\s*$/
 	);
 	if (!match) {
-		return { date: null, title: basename.trim() || "Голосовое" };
+		return { date: null, title: basename.trim() || "Voice memo" };
 	}
 	const [, dd, mm, yyyy] = match;
 	const title = basename.slice(0, match.index).replace(/@\s*$/, "").trim();
-	return { date: `${yyyy}-${mm}-${dd}`, title: title || "Голосовое" };
+	return { date: `${yyyy}-${mm}-${dd}`, title: title || "Voice memo" };
+}
+
+
+/** Folder autocomplete for a plain text input, so a vault path is picked rather
+ *  than typed from memory. */
+class FolderSuggest extends AbstractInputSuggest<TFolder> {
+	constructor(app: App, private input: HTMLInputElement) {
+		super(app, input);
+	}
+
+	getSuggestions(query: string): TFolder[] {
+		const lower = query.toLowerCase();
+		return this.app.vault
+			.getAllFolders(true)
+			.filter((folder) => folder.path.toLowerCase().includes(lower))
+			.slice(0, 100);
+	}
+
+	renderSuggestion(folder: TFolder, el: HTMLElement): void {
+		el.setText(folder.path === "" ? "/" : folder.path);
+	}
+
+	selectSuggestion(folder: TFolder): void {
+		this.input.value = folder.path;
+		this.input.trigger("input");
+		this.close();
+	}
 }
 
 class WhisperTranscribeSettingTab extends PluginSettingTab {
@@ -385,9 +459,9 @@ class WhisperTranscribeSettingTab extends PluginSettingTab {
 		containerEl.empty();
 
 		new Setting(containerEl)
-			.setName("Автоматически транскрибировать")
+			.setName("Transcribe automatically")
 			.setDesc(
-				"Запускать расшифровку сразу, как только в отслеживаемую папку попадает новый аудиофайл."
+				"Transcribe each new audio file as soon as it appears in the watched folder."
 			)
 			.addToggle((toggle) =>
 				toggle
@@ -399,57 +473,86 @@ class WhisperTranscribeSettingTab extends PluginSettingTab {
 			);
 
 		new Setting(containerEl)
-			.setName("Отслеживаемая папка")
-			.setDesc("Новые аудиофайлы в этой папке (и подпапках) запускают расшифровку.")
-			.addText((text) =>
+			.setName("Watched folder")
+			.setDesc(
+				"New audio files here (and in its subfolders) get transcribed. Leave empty to watch the whole vault."
+			)
+			.addText((text) => {
 				text
-					.setPlaceholder("Телеграм аудио")
+					.setPlaceholder("Whole vault")
 					.setValue(this.plugin.settings.watchFolder)
 					.onChange(async (value) => {
 						this.plugin.settings.watchFolder = value.trim();
 						await this.plugin.saveSettings();
-					})
-			);
+					});
+				new FolderSuggest(this.app, text.inputEl);
+			});
 
 		new Setting(containerEl)
-			.setName("Папка для результата")
-			.setDesc("Куда класть готовые .md-расшифровки.")
-			.addText((text) =>
+			.setName("Save transcripts to")
+			.setDesc(
+				"Where the transcript notes go. Leave empty to put each one next to its audio file."
+			)
+			.addText((text) => {
 				text
-					.setPlaceholder("inbox")
+					.setPlaceholder("Next to the audio file")
 					.setValue(this.plugin.settings.outputFolder)
 					.onChange(async (value) => {
 						this.plugin.settings.outputFolder = value.trim();
 						await this.plugin.saveSettings();
-					})
-			);
+					});
+				new FolderSuggest(this.app, text.inputEl);
+			});
 
 		new Setting(containerEl)
-			.setName("Модель")
+			.setName("Model")
 			.setDesc(
-				"Больше — точнее, но медленнее и тяжелее для скачивания/памяти. На телефоне рекомендуется tiny или base."
+				"Larger models are more accurate but slower, and are downloaded once before first use. On a phone, prefer one of the first two."
 			)
-			.addDropdown((dropdown) =>
+			.addDropdown((dropdown) => {
+				for (const model of MODELS) {
+					dropdown.addOption(model.id, model.label);
+				}
 				dropdown
-					.addOption("Xenova/whisper-tiny", "tiny (~40 МБ, быстрее всего)")
-					.addOption("Xenova/whisper-base", "base (~74 МБ, баланс)")
-					.addOption("Xenova/whisper-small", "small (~250 МБ, точнее)")
 					.setValue(this.plugin.settings.modelId)
 					.onChange(async (value) => {
 						this.plugin.settings.modelId = value;
 						await this.plugin.saveSettings();
-					})
-			);
+						new Notice(
+							"Model changed. It is downloaded on the next transcription."
+						);
+					});
+			});
 
 		new Setting(containerEl)
-			.setName("Язык")
-			.setDesc("Язык речи в голосовых (английским словом, как ожидает Whisper).")
-			.addText((text) =>
-				text
-					.setPlaceholder("russian")
+			.setName("Language")
+			.setDesc(
+				"Whisper detects the language on its own. Pick one only to pin it — useful for short or noisy recordings, where detection can guess wrong."
+			)
+			.addDropdown((dropdown) => {
+				dropdown.addOption(AUTO_LANGUAGE, "Detect automatically");
+				for (const [, name] of WHISPER_LANGUAGES) {
+					dropdown.addOption(name.toLowerCase(), name);
+				}
+				dropdown
 					.setValue(this.plugin.settings.language)
 					.onChange(async (value) => {
-						this.plugin.settings.language = value.trim();
+						this.plugin.settings.language = value;
+						await this.plugin.saveSettings();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName("Note header")
+			.setDesc(
+				"First line of each transcript note. {{filename}} is replaced with the audio file's name. Leave empty for no header."
+			)
+			.addText((text) =>
+				text
+					.setPlaceholder("[Source: voice memo «{{filename}}»]")
+					.setValue(this.plugin.settings.noteHeader)
+					.onChange(async (value) => {
+						this.plugin.settings.noteHeader = value;
 						await this.plugin.saveSettings();
 					})
 			);
