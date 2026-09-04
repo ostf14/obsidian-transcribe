@@ -7,7 +7,13 @@ declare const __ASR_WORKER_SOURCE__: string;
 export interface AsrHooks {
 	onProgress?: (percent: number) => void;
 	onWasmFallback?: () => void;
+	onTranscribing?: () => void;
 }
+
+/** How long the worker may go completely silent — no progress, no result — before
+ *  we treat it as dead. Long files are fine: inference still reports nothing for
+ *  minutes, so this only has to be longer than any plausible quiet stretch. */
+const SILENCE_TIMEOUT_MS = 15 * 60 * 1000;
 
 interface Pending {
 	resolve: (text: string) => void;
@@ -26,6 +32,7 @@ export class AsrClient {
 	private workerUnavailable = false;
 	private pending = new Map<number, Pending>();
 	private nextId = 1;
+	private watchdog: number | null = null;
 	private inProcess: Promise<
 		(audio: Float32Array, options?: Record<string, unknown>) => Promise<{ text: string }>
 	> | null = null;
@@ -99,12 +106,16 @@ export class AsrClient {
 	}
 
 	private handleMessage(message: any) {
+		this.noteActivity();
 		switch (message?.type) {
 			case "progress":
 				this.hooks.onProgress?.(message.percent);
 				return;
 			case "wasm-fallback":
 				this.hooks.onWasmFallback?.();
+				return;
+			case "transcribing":
+				this.hooks.onTranscribing?.();
 				return;
 			case "result": {
 				const pending = this.pending.get(message.id);
@@ -124,6 +135,31 @@ export class AsrClient {
 	private failAllPending(err: Error) {
 		for (const pending of this.pending.values()) pending.reject(err);
 		this.pending.clear();
+		this.clearWatchdog();
+	}
+
+	/** Restarts the silence watchdog on every sign of life from the worker. */
+	private noteActivity() {
+		this.clearWatchdog();
+		if (this.pending.size === 0) return;
+		this.watchdog = window.setTimeout(() => {
+			this.failAllPending(
+				new Error(
+					`The worker went silent for ${Math.round(
+						SILENCE_TIMEOUT_MS / 60000
+					)} minutes — it most likely ran out of memory. Try a smaller model.`
+				)
+			);
+			// Whatever state it is in, it is not worth reusing.
+			this.terminate();
+		}, SILENCE_TIMEOUT_MS);
+	}
+
+	private clearWatchdog() {
+		if (this.watchdog !== null) {
+			window.clearTimeout(this.watchdog);
+			this.watchdog = null;
+		}
 	}
 
 	private runInWorker(
@@ -140,6 +176,7 @@ export class AsrClient {
 			// recording if the worker turned out to be unusable. A few megabytes of
 			// PCM is a cheap price for that not to happen.
 			worker.postMessage({ type: "transcribe", id, modelId, audio, language });
+			this.noteActivity();
 		});
 	}
 

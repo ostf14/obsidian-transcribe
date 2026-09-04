@@ -10,29 +10,10 @@ import {
 	normalizePath,
 } from "obsidian";
 import { AsrClient } from "./asr-client";
+import { MODELS } from "./models";
 import { WHISPER_LANGUAGES } from "./languages";
 
 const AUDIO_EXTENSIONS = ["ogg", "oga", "m4a", "mp3", "wav", "webm", "opus"];
-
-/**
- * Whisper's own checkpoint names (tiny/base/small/medium/large) say nothing about
- * what a user actually chooses between, so the dropdown is labelled by the
- * trade-off — speed against accuracy — with the download size, which is the other
- * thing that matters, especially on a phone.
- */
-const MODELS: ReadonlyArray<{
-	id: string;
-	label: string;
-}> = [
-	{ id: "Xenova/whisper-tiny", label: "Fastest, least accurate — 40 MB" },
-	{ id: "Xenova/whisper-base", label: "Fast — 75 MB" },
-	{ id: "Xenova/whisper-small", label: "Balanced — 250 MB" },
-	{ id: "Xenova/whisper-medium", label: "Accurate, slow — 750 MB" },
-	{
-		id: "onnx-community/whisper-large-v3-turbo",
-		label: "Most accurate, desktop only — 800 MB",
-	},
-];
 
 const AUTO_LANGUAGE = "auto";
 
@@ -75,6 +56,10 @@ export default class WhisperTranscribePlugin extends Plugin {
 				this.statusEl.setText(`Downloading model… ${Math.round(percent)}%`),
 			onWasmFallback: () =>
 				this.statusEl.setText("WebGPU unavailable, using WASM…"),
+			// The model is only loaded once, so telling the two stages apart matters:
+			// a long wait during the download means something different to the user
+			// than a long wait during inference.
+			onTranscribing: () => this.statusEl.setText("Transcribing…"),
 		});
 
 		// Only start listening once the vault has finished its initial load:

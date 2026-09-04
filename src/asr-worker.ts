@@ -48,6 +48,36 @@ function getPipeline(modelId: string): Promise<AsrPipeline> {
 	return pipelinePromise;
 }
 
+/** The id currently being worked on, so a failure that escapes the awaited chain
+ *  can still be reported against it instead of leaving the caller waiting. */
+let activeId: number | null = null;
+
+function reportEscapedFailure(reason: unknown) {
+	const detail = String(
+		(reason as { message?: string })?.message ?? reason ?? "unknown error"
+	);
+	if (activeId !== null) {
+		const id = activeId;
+		activeId = null;
+		post({ type: "error", id, error: detail });
+	}
+	// A half-initialised pipeline is not reusable after an out-of-memory failure.
+	pipelinePromise = null;
+	loadedModelId = null;
+}
+
+// Model loading detaches promises internally (streamed downloads, wasm init), so
+// an out-of-memory RangeError can surface here rather than at our await. Without
+// this the caller would wait forever on a request that already died.
+self.addEventListener("unhandledrejection", (event: PromiseRejectionEvent) => {
+	event.preventDefault();
+	reportEscapedFailure(event.reason);
+});
+
+self.addEventListener("error", (event: ErrorEvent) => {
+	reportEscapedFailure(event.message);
+});
+
 self.onmessage = async (event: MessageEvent<IncomingMessage>) => {
 	const message = event.data;
 
@@ -62,17 +92,25 @@ self.onmessage = async (event: MessageEvent<IncomingMessage>) => {
 	}
 
 	if (message.type === "transcribe") {
+		activeId = message.id;
 		try {
 			const pipeline = await getPipeline(message.modelId);
+			post({ type: "transcribing" });
 			const result = await pipeline(message.audio, {
 				language: message.language,
 				task: "transcribe",
 				chunk_length_s: 30,
 				stride_length_s: 5,
 			});
-			post({ type: "result", id: message.id, text: result.text });
+			if (activeId === message.id) {
+				activeId = null;
+				post({ type: "result", id: message.id, text: result.text });
+			}
 		} catch (err) {
-			post({ type: "error", id: message.id, error: String(err) });
+			if (activeId === message.id) {
+				activeId = null;
+				post({ type: "error", id: message.id, error: String(err) });
+			}
 		}
 	}
 };

@@ -69,6 +69,8 @@ export async function withBrowserLikeProcess<T>(fn: () => Promise<T>): Promise<T
 	}
 }
 
+import { dtypeFor, findModel } from "./models";
+
 /** Builds the ASR pipeline, preferring WebGPU and falling back to WASM. Shared by
  *  the worker and by the in-process path used when a worker cannot be created. */
 export async function createAsrPipeline(
@@ -99,23 +101,27 @@ export async function createAsrPipeline(
 			}
 		};
 
+		const model = findModel(modelId);
+
 		if (typeof navigator !== "undefined" && "gpu" in navigator) {
 			try {
-				const gpu = await pipeline(
-					"automatic-speech-recognition",
-					modelId,
-					{ device: "webgpu", progress_callback }
-				);
+				const gpu = await pipeline("automatic-speech-recognition", modelId, {
+					device: "webgpu",
+					dtype: dtypeFor("webgpu", model),
+					progress_callback,
+				});
 				return gpu as any;
 			} catch (err) {
 				// A machine can advertise navigator.gpu and still fail to bring up a
-				// usable adapter (old drivers, blocklisted GPU). WASM always works.
+				// usable adapter (old drivers, blocklisted GPU), and a large model can
+				// run the machine out of memory. WASM is slower but far less demanding.
 				hooks.onWasmFallback?.(err);
 			}
 		}
 
 		const cpu = await pipeline("automatic-speech-recognition", modelId, {
 			device: "wasm",
+			dtype: dtypeFor("wasm", model),
 			progress_callback,
 		});
 		return cpu as any;
